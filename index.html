@@ -70,6 +70,13 @@
     .stage{width:100%;background:#000;overflow:hidden;line-height:0;border-radius:4px;border:1px solid var(--line)}
     .stage canvas{display:block;width:100%;max-width:100%;height:auto}
     .cardactions{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+    .cardactions .geturl{grid-column:1 / 2}
+    .btn:disabled{opacity:.55;cursor:progress}
+    .urlbox{display:flex;gap:6px;align-items:stretch}
+    .urlbox input{flex:1;min-width:0;background:var(--ink);border:1px solid var(--line);color:var(--ok);border-radius:3px;padding:8px 9px;font-size:12px;font-family:ui-monospace,Menlo,Consolas,monospace}
+    .urlbox button{flex:0 0 auto;width:auto;padding:8px 12px}
+    .urlbox a{display:flex;align-items:center;padding:0 10px;border:1px solid var(--line);border-radius:3px;color:var(--mute);text-decoration:none;font-family:var(--util);font-size:12px;letter-spacing:.14em;text-transform:uppercase}
+    .urlbox a:hover{color:var(--paper);border-color:var(--paper)}
     .mini{font-size:12px;line-height:1.4;color:#d9dee4;word-break:break-word}
     .pill{display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:999px;padding:4px 8px;font-size:10px;letter-spacing:.12em;text-transform:uppercase;font-family:var(--util);color:var(--mute)}
     .pill.ok{border-color:rgba(137,209,133,.35);color:var(--ok)}
@@ -157,6 +164,15 @@
           <button class="btn ghost" id="downloadManifest" type="button">Descargar manifiesto JSON</button>
         </div>
         <p class="hint">Cada salida se genera en PNG de <strong>1080 × 1080</strong>. El ZIP incluye todas las imágenes renderizadas correctamente.</p>
+      </div>
+
+      <div class="grp">
+        <span class="lbl">Publicación en R2 (Cloudflare)</span>
+        <span class="sub">URL del Worker</span>
+        <input type="text" id="r2Endpoint" placeholder="https://portadas-r2.tu-cuenta.workers.dev" autocomplete="off" spellcheck="false">
+        <span class="sub" style="display:block;margin-top:8px">Token de subida</span>
+        <input type="text" id="r2Token" placeholder="El mismo valor de UPLOAD_TOKEN" autocomplete="off" spellcheck="false">
+        <p class="hint">El botón <strong>Obtener URL</strong> de cada portada sube el PNG a tu bucket de R2 y devuelve un enlace público. Estos datos se guardan solo en este navegador.</p>
       </div>
 
       <div class="grp">
@@ -438,6 +454,7 @@
           fuente: item.fuente ? String(item.fuente) : '',
           im: null,
           tainted:false,
+          publicUrl:'',
           ok:false,
           error:''
         };
@@ -457,6 +474,12 @@
         '<div class="cardactions">'+
           '<button class="btn secondary" type="button">Descargar PNG</button>'+
           '<button class="btn ghost" type="button">Copiar JSON</button>'+
+          '<button class="btn geturl" type="button">Obtener URL</button>'+
+        '</div>'+
+        '<div class="urlbox" hidden>'+
+          '<input type="text" readonly aria-label="URL pública">'+
+          '<button class="btn secondary" type="button">Copiar</button>'+
+          '<a target="_blank" rel="noopener">Abrir</a>'+
         '</div>';
 
       var ctx = $('canvas',card).getContext('2d');
@@ -480,7 +503,76 @@
         var json = JSON.stringify({titulo:item.titulo, imagen:item.imagen, destacado:item.destacado, slug:item.slug}, null, 2);
         navigator.clipboard.writeText(json).then(function(){ toast('JSON copiado.'); }).catch(function(){ toast('No se pudo copiar.'); });
       });
+
+      var urlBox = $('.urlbox', card), urlInput = $('input', urlBox), urlCopy = $('button', urlBox), urlOpen = $('a', urlBox);
+      function showUrl(u){
+        urlInput.value = u; urlOpen.href = u; urlBox.hidden = false;
+      }
+      if(item.publicUrl) showUrl(item.publicUrl);
+
+      buttons[2].addEventListener('click', function(){
+        var btn = buttons[2];
+        btn.disabled = true; btn.textContent = 'Subiendo…';
+        uploadCanvas($('canvas',card), item).then(function(u){
+          item.publicUrl = u;
+          showUrl(u);
+          btn.textContent = 'Volver a subir';
+          return navigator.clipboard.writeText(u).then(function(){ toast('URL copiada al portapapeles.'); }, function(){ toast('URL lista.'); });
+        }).catch(function(err){
+          btn.textContent = 'Obtener URL';
+          toast(err.message || 'No se pudo subir la imagen.');
+        }).then(function(){ btn.disabled = false; });
+      });
+      urlCopy.addEventListener('click', function(){
+        navigator.clipboard.writeText(urlInput.value).then(function(){ toast('URL copiada.'); }).catch(function(){ urlInput.select(); toast('Selecciona y copia manualmente.'); });
+      });
+      urlInput.addEventListener('focus', function(){ urlInput.select(); });
       return card;
+    }
+
+    // ---------- R2 ----------
+    var LS_EP='portadas.r2.endpoint', LS_TK='portadas.r2.token';
+    function lsGet(k){ try{ return localStorage.getItem(k)||''; }catch(e){ return ''; } }
+    function lsSet(k,v){ try{ localStorage.setItem(k,v); }catch(e){} }
+
+    function canvasBlob(canvas){
+      return new Promise(function(ok,no){
+        try{
+          canvas.toBlob(function(b){ b ? ok(b) : no(new Error('No se pudo generar el PNG.')); }, 'image/png');
+        }catch(err){ no(err); }
+      });
+    }
+
+    async function uploadCanvas(canvas, item){
+      var ep = ($('#r2Endpoint').value||'').trim().replace(/\/+$/,'');
+      var tk = ($('#r2Token').value||'').trim();
+      if(!ep) throw new Error('Configura primero la URL del Worker en el panel “Publicación en R2”.');
+      var blob;
+      try{ blob = await canvasBlob(canvas); }
+      catch(e){ throw new Error(item.tainted ? 'La imagen de origen bloquea la exportación (CORS). Usa una imagen descargada o data URL.' : 'No se pudo generar el PNG.'); }
+      var res;
+      try{
+        res = await fetch(ep + '/upload?slug=' + encodeURIComponent(item.slug), {
+          method:'POST',
+          headers:{ 'Content-Type':'image/png', 'X-Upload-Token': tk },
+          body: blob
+        });
+      }catch(e){ throw new Error('No hubo conexión con el Worker. Revisa la URL.'); }
+      var data = null;
+      try{ data = await res.json(); }catch(e){}
+      if(!res.ok || !data || !data.url){
+        throw new Error((data && data.error) ? 'R2: ' + data.error : 'El Worker respondió con error ' + res.status + '.');
+      }
+      return data.url;
+    }
+
+    async function uploadAll(){
+      var cards = $$('#cards .card'), urls = [];
+      for(var i=0;i<state.rendered.length;i++){
+        try{ urls.push({slug:state.rendered[i].slug, url: state.rendered[i].publicUrl = await uploadCanvas($('canvas',cards[i]), state.rendered[i])}); }
+        catch(err){ urls.push({slug:state.rendered[i].slug, url:null, error:err.message}); }
+      }
+      return urls;
     }
 
     function escapeHtml(s){
@@ -575,7 +667,7 @@
     function downloadManifest(){
       var items = state.rendered.length ? state.rendered : [];
       var payload = items.map(function(item){
-        return {titulo:item.titulo, imagen:item.imagen, destacado:item.destacado, slug:item.slug, ok:item.ok, aviso:item.error||''};
+        return {titulo:item.titulo, imagen:item.imagen, destacado:item.destacado, slug:item.slug, ok:item.ok, url:item.publicUrl||'', aviso:item.error||''};
       });
       var blob = new Blob([JSON.stringify(payload,null,2)], {type:'application/json'});
       var a=document.createElement('a');
@@ -638,6 +730,11 @@
       $$('#cajaSeg button').forEach(function(x){ x.setAttribute('aria-pressed', String(x===b)); });
     });
 
+    $('#r2Endpoint').value = lsGet(LS_EP);
+    $('#r2Token').value = lsGet(LS_TK);
+    $('#r2Endpoint').addEventListener('change', function(e){ lsSet(LS_EP, e.target.value.trim()); });
+    $('#r2Token').addEventListener('change', function(e){ lsSet(LS_TK, e.target.value.trim()); });
+
     $('#renderAll').addEventListener('click', renderAll);
     $('#downloadZip').addEventListener('click', downloadZip);
     $('#downloadManifest').addEventListener('click', downloadManifest);
@@ -664,6 +761,7 @@
       renderFromArray: function(arr){ $('#jsonInput').value = JSON.stringify(arr,null,2); return renderAll(); },
       renderFromJSON: function(json){ $('#jsonInput').value = json; return renderAll(); },
       downloadAll: downloadZip,
+      uploadAll: uploadAll,
       getRendered: function(){ return state.rendered.slice(); },
       getConfig: function(){
         return {fx:state.fx, fy:state.fy, zoom:state.zoom, escala:state.escala, verde:state.verde, hl:state.hl, caja:state.caja};
